@@ -4,3 +4,14 @@
 docs/readthedocs/_build
 docs/readthedocs/vbeam/_autosummary
 build
+friends/data/
+friends/outputs/
+**/.matplotlib/
+.jupyter_config/
+.jupyter_data/
+.jupyter_runtime/
+.ipython/
+anaconda_projects/
+**/.ipynb_checkpoints/
+.idea/
+%SystemDrive%/
