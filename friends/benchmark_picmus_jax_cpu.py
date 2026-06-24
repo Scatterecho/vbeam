@@ -1,22 +1,18 @@
-"""Benchmark vbeam PICMUS plane-wave DAS on CPU/JAX.
+﻿"""Benchmark vbeam PICMUS plane-wave DAS with JAX.
 
-The goal is to separate data/setup time, beamformer construction time, JIT compile
-plus first execution time, and repeated execution time. The default cases are chosen
-for teaching on a CPU machine; use --include-native-full only when you are ready for
-a much heavier run.
+The script separates setup time, beamformer construction time, compile/first-run
+time, and repeated steady-state execution time. It can run on CPU or GPU depending
+on the active JAX backend.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 import argparse
-import csv
 import os
 import site
 import sys
 import time
-from typing import Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 os.environ.setdefault("MPLCONFIGDIR", str(SCRIPT_DIR / ".matplotlib"))
@@ -32,52 +28,48 @@ sys.path = [
 import jax
 from pyuff_ustb import Uff
 
+from benchmark_helpers import (
+    BenchmarkCase,
+    benchmark_metadata,
+    compute_timing_stats,
+    first_or_empty,
+    nonnegative_int,
+    nvidia_smi_snapshot,
+    positive_int,
+    resolve_uff_path,
+    run_warmups,
+    seconds_since,
+    select_cases,
+    time_call,
+    timed_repeats,
+    write_csv,
+)
 from vbeam.beamformers import get_das_beamformer
 from vbeam.data_importers import import_pyuff
 from vbeam.fastmath import backend_manager
-from vbeam.util.download import cached_download
 
 
-DATA_URL = "http://www.ustb.no/datasets/PICMUS_carotid_cross.uff"
-
-
-@dataclass(frozen=True)
-class BenchmarkCase:
-    name: str
-    scan_x: Optional[int]
-    scan_z: Optional[int]
-    n_tx: int
-
-    @property
-    def scan_label(self) -> str:
-        if self.scan_x is None or self.scan_z is None:
-            return "native"
-        return f"{self.scan_x}x{self.scan_z}"
+ALL_CASES = [
+    BenchmarkCase("resize_48x64_tx1", 48, 64, 1),
+    BenchmarkCase("resize_48x64_tx5", 48, 64, 5),
+    BenchmarkCase("resize_96x128_tx15", 96, 128, 15),
+    BenchmarkCase("resize_96x128_tx75", 96, 128, 75),
+    BenchmarkCase("native_scan_tx1", None, None, 1),
+    BenchmarkCase("native_scan_tx75", None, None, 75),
+]
+DEFAULT_CASE_NAMES = {
+    "resize_48x64_tx1",
+    "resize_48x64_tx5",
+    "resize_96x128_tx15",
+    "resize_96x128_tx75",
+    "native_scan_tx1",
+}
 
 
 def default_cases(include_native_full: bool) -> list[BenchmarkCase]:
-    cases = [
-        BenchmarkCase("resize_48x64_tx1", 48, 64, 1),
-        BenchmarkCase("resize_48x64_tx5", 48, 64, 5),
-        BenchmarkCase("resize_96x128_tx15", 96, 128, 15),
-        BenchmarkCase("resize_96x128_tx75", 96, 128, 75),
-        BenchmarkCase("native_scan_tx1", None, None, 1),
-    ]
     if include_native_full:
-        cases.append(BenchmarkCase("native_scan_tx75", None, None, 75))
-    return cases
-
-
-def seconds_since(start: float) -> float:
-    return time.perf_counter() - start
-
-
-def time_call(fn) -> tuple[float, object]:
-    start = time.perf_counter()
-    value = fn()
-    if hasattr(value, "block_until_ready"):
-        value.block_until_ready()
-    return seconds_since(start), value
+        return list(ALL_CASES)
+    return [case for case in ALL_CASES if case.name in DEFAULT_CASE_NAMES]
 
 
 def prepare_setup(channel_data, scan, case: BenchmarkCase):
@@ -90,10 +82,20 @@ def prepare_setup(channel_data, scan, case: BenchmarkCase):
     return setup
 
 
-def run_case(channel_data, scan, case: BenchmarkCase) -> dict:
+def run_case(
+    channel_data,
+    scan,
+    case: BenchmarkCase,
+    *,
+    warmups: int,
+    repeats: int,
+    metadata: dict,
+    record_nvidia_smi: bool,
+) -> dict:
     if hasattr(jax, "clear_caches"):
         jax.clear_caches()
 
+    nvidia_smi_before = nvidia_smi_snapshot(record_nvidia_smi)
     setup_time, setup = time_call(lambda: prepare_setup(channel_data, scan, case))
     sizes = setup.size()
 
@@ -108,28 +110,32 @@ def run_case(channel_data, scan, case: BenchmarkCase) -> dict:
     )
     build_time = seconds_since(build_start)
 
-    first_run, result = time_call(lambda: beamformer(**setup.data))
-    second_run, _ = time_call(lambda: beamformer(**setup.data))
-    third_run, _ = time_call(lambda: beamformer(**setup.data))
+    run_fn = lambda: beamformer(**setup.data)
+    first_run, first_result = time_call(run_fn)
+    run_warmups(run_fn, warmups)
+    repeat_times, repeat_result = timed_repeats(run_fn, repeats)
+    result = repeat_result if repeat_result is not None else first_result
 
-    device = jax.devices()[0]
+    timing = compute_timing_stats(repeat_times)
+    nvidia_smi_after = nvidia_smi_snapshot(record_nvidia_smi)
 
     return {
-        "backend": jax.default_backend(),
-        "jax_version": jax.__version__,
-        "device": getattr(device, "device_kind", str(device)),
+        **metadata,
+        "nvidia_smi_before_case": nvidia_smi_before,
         "case": case.name,
         "scan": case.scan_label,
         "points": sizes["points"],
         "receivers": sizes["receivers"],
         "transmits": sizes["transmits"],
         "signal_time": sizes["signal_time"],
+        "warmups": warmups,
         "setup_s": setup_time,
         "build_s": build_time,
         "first_run_s": first_run,
-        "second_run_s": second_run,
-        "third_run_s": third_run,
-        "steady_mean_s": (second_run + third_run) / 2,
+        "second_run_s": first_or_empty(repeat_times, 0),
+        "third_run_s": first_or_empty(repeat_times, 1),
+        **timing,
+        "nvidia_smi_after_case": nvidia_smi_after,
         "result_shape": "x".join(str(x) for x in result.shape),
         "result_dtype": str(result.dtype),
     }
@@ -144,16 +150,17 @@ def print_table(rows: list[dict]) -> None:
         "setup_s",
         "build_s",
         "first_run_s",
-        "second_run_s",
-        "third_run_s",
+        "steady_median_s",
         "steady_mean_s",
+        "steady_min_s",
+        "steady_max_s",
         "result_shape",
     ]
     widths = {
         header: max(
             len(header),
             *[
-                len(f"{row[header]:.3f}")
+                len(f"{row[header]:.4f}")
                 if isinstance(row[header], float)
                 else len(str(row[header]))
                 for row in rows
@@ -170,23 +177,57 @@ def print_table(rows: list[dict]) -> None:
         for header in headers:
             value = row[header]
             if isinstance(value, float):
-                value = f"{value:.3f}"
+                value = f"{value:.4f}"
             values.append(str(value).ljust(widths[header]))
         print(" ".join(values))
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--include-native-full",
         action="store_true",
-        help="Also run native scan with all 75 transmits. This can be very slow on CPU.",
+        help="Also run native scan with all 75 transmits.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--cases",
+        help=(
+            "Comma-separated case names to run. Use 'all' for every case. "
+            "Available: " + ", ".join(case.name for case in ALL_CASES)
+        ),
+    )
+    parser.add_argument("--warmups", type=nonnegative_int, default=0)
+    parser.add_argument("--repeats", type=positive_int, default=2)
+    parser.add_argument("--data-path", type=Path, help="Explicit PICMUS UFF file path.")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=SCRIPT_DIR / "data",
+        help="Cache directory used when --data-path is not provided.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=SCRIPT_DIR / "outputs",
+        help="Directory for the CSV output.",
+    )
+    parser.add_argument(
+        "--record-nvidia-smi",
+        action="store_true",
+        help="Record nvidia-smi snapshots before and after each case.",
+    )
+    return parser.parse_args()
 
+
+def main() -> None:
+    args = parse_args()
     backend_manager.active_backend = "jax"
-    output_dir = SCRIPT_DIR / "outputs"
-    output_dir.mkdir(exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    cases = select_cases(
+        ALL_CASES if args.cases else default_cases(args.include_native_full),
+        args.cases,
+    )
 
     print(f"Python executable: {sys.executable}")
     backend = jax.default_backend()
@@ -194,15 +235,16 @@ def main() -> None:
     print(f"JAX backend: {backend}")
     print(f"JAX devices: {jax.devices()}")
     print("Downloading/loading dataset...")
-    download_time, uff_path = time_call(
-        lambda: cached_download(DATA_URL, local_dir=str(SCRIPT_DIR / "data"))
+    uff_path, download_time = resolve_uff_path(
+        data_path=args.data_path,
+        data_dir=args.data_dir,
     )
     print(f"UFF path: {uff_path}")
     print(f"download/cache time: {download_time:.3f} s")
 
     print("Reading UFF channel_data and scan...")
     read_start = time.perf_counter()
-    uff = Uff(uff_path)
+    uff = Uff(str(uff_path))
     channel_data = uff.read("/channel_data")
     scan = uff.read("/scan")
     read_time = seconds_since(read_start)
@@ -214,22 +256,38 @@ def main() -> None:
         type(scan).__name__,
     )
 
+    metadata = benchmark_metadata(jax, uff_path)
+    metadata["uff_read_s"] = read_time
+    metadata["download_cache_s"] = download_time
+
     rows = []
-    for case in default_cases(args.include_native_full):
+    for case in cases:
         print()
         print(f"Running case: {case.name} scan={case.scan_label} n_tx={case.n_tx}")
-        rows.append(run_case(channel_data, scan, case))
+        rows.append(
+            run_case(
+                channel_data,
+                scan,
+                case,
+                warmups=args.warmups,
+                repeats=args.repeats,
+                metadata=metadata,
+                record_nvidia_smi=args.record_nvidia_smi,
+            )
+        )
 
     print_table(rows)
 
-    output_path = output_dir / f"picmus_jax_benchmark_{backend}.csv"
-    with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    output_path = args.output_dir / f"picmus_jax_benchmark_{backend}.csv"
+    write_csv(output_path, rows)
     print()
     print(f"Saved CSV: {output_path}")
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
